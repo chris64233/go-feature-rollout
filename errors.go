@@ -21,6 +21,9 @@ const (
 	KindConflict ErrorKind = "conflict"
 	// KindNotFound 草拟、功能等对象不存在。
 	KindNotFound ErrorKind = "not_found"
+	// KindStale 过期操作：上报/暂停基于的版本或快照已不是当前状态
+	// （如手工回滚、重新发布已经发生），操作被拒绝。
+	KindStale ErrorKind = "stale"
 )
 
 // Error 是服务返回的统一错误类型，携带类别信息。
@@ -64,4 +67,8 @@ func conflictErr(format string, args ...any) error {
 
 func notFoundErr(format string, args ...any) error {
 	return &Error{Kind: KindNotFound, Msg: fmt.Sprintf(format, args...)}
+}
+
+func staleErr(format string, args ...any) error {
+	return &Error{Kind: KindStale, Msg: fmt.Sprintf(format, args...)}
 }

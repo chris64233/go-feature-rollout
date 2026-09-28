@@ -31,29 +31,68 @@ type Service struct {
 	// 按序列号保存每一份曾经生效的快照，用于回滚时重新激活历史一致快照。
 	snapshots map[uint64]*Snapshot
 	// 单调递增的发布序列号。
-	seq uint64
+	seq     uint64
 	history []PublishRecord
 
 	// 外部变更号 -> 该变更号首次成功发布产生的记录。
 	// 同号重复提交时比对内容哈希：一致则幂等返回，不一致报冲突。
-	changeSeq map[string]uint64
+	changeSeq  map[string]uint64
 	changeHash map[string]string
+
+	// ---- 线上结果守卫 ----
+
+	// stats 按 "feature@version" 保存每个版本的去重计数，版本之间完全隔离。
+	stats map[string]*versionStats
+	// resultIndex 是全局结果去重索引：ResultID -> 所属统计键，
+	// 重复上报不重复计数，同一 ID 改挂别的版本按冲突拒绝。
+	resultIndex map[string]string
+	// paused 记录每个功能已被自动暂停的版本及其事件：同一版本只允许暂停一次，
+	// 之后的重复上报、重复检查都不会再产生状态变化和通知。
+	pauseEventsByVersion map[string]map[int]*PauseEvent
+	// pauseEvents 永久保留每次自动暂停的统计依据，顺序即发生顺序。
+	pauseEvents []*PauseEvent
+	// notifier 在每次"首次"自动暂停成功后、锁外被调用；为 nil 则不通知。
+	notifier func(PauseEvent)
+}
+
+// versionStats 是某个功能某个版本的去重结果集合。
+type versionStats struct {
+	feature    string
+	version    int
+	resultIDs  map[string]struct{}
+	failureIDs map[string]struct{}
+}
+
+func statsKey(feature string, version int) string {
+	return fmt.Sprintf("%s@%d", feature, version)
 }
 
 // NewService 创建空服务。
 func NewService() *Service {
 	s := &Service{
-		drafts:     map[string]*Draft{},
-		versions:   map[string]map[int]*RuleVersion{},
-		current:    map[string]int{},
-		snapshots:  map[uint64]*Snapshot{},
-		changeSeq:  map[string]uint64{},
-		changeHash: map[string]string{},
+		drafts:               map[string]*Draft{},
+		versions:             map[string]map[int]*RuleVersion{},
+		current:              map[string]int{},
+		snapshots:            map[uint64]*Snapshot{},
+		changeSeq:            map[string]uint64{},
+		changeHash:           map[string]string{},
+		stats:                map[string]*versionStats{},
+		resultIndex:          map[string]string{},
+		pauseEventsByVersion: map[string]map[int]*PauseEvent{},
 	}
 	empty := &Snapshot{Seq: 0, Rules: map[string]*RuleVersion{}}
 	s.currentSnap = empty
 	s.snapshots[0] = empty
 	return s
+}
+
+// SetNotifier 设置自动暂停通知回调。回调在暂停提交成功后、服务锁外被调用，
+// 因此每次自动暂停至多通知一次（与 ReportResult.Paused 一一对应）；
+// 重复上报、重复检查、过期拒绝都不会触发回调。回调内应避免再调用本服务的加锁方法。
+func (s *Service) SetNotifier(f func(PauseEvent)) {
+	s.mu.Lock()
+	s.notifier = f
+	s.mu.Unlock()
 }
 
 // ---------------- 草拟 ----------------
@@ -519,6 +558,14 @@ func validateRules(rules []RuleInput) error {
 		if r.Percentage < 0 || r.Percentage > 100 {
 			return paramErr("feature %q percentage must be in [0,100], got %d", r.Feature, r.Percentage)
 		}
+		if r.MinObservations < 0 {
+			return paramErr("feature %q version %d MinObservations must be >= 0, got %d",
+				r.Feature, r.Version, r.MinObservations)
+		}
+		if r.MaxFailureRate < 0 || r.MaxFailureRate > 1 {
+			return paramErr("feature %q version %d MaxFailureRate must be in [0,1], got %v",
+				r.Feature, r.Version, r.MaxFailureRate)
+		}
 		depFeatures := map[string]bool{}
 		for _, dep := range r.Deps {
 			if dep.Feature == "" {
@@ -541,12 +588,14 @@ func validateRules(rules []RuleInput) error {
 
 func toRuleVersion(in RuleInput) *RuleVersion {
 	rv := &RuleVersion{
-		Feature:    in.Feature,
-		Version:    in.Version,
-		Percentage: in.Percentage,
-		Include:    map[string]struct{}{},
-		Exclude:    map[string]struct{}{},
-		Deps:       append([]Dependency(nil), in.Deps...),
+		Feature:         in.Feature,
+		Version:         in.Version,
+		Percentage:      in.Percentage,
+		Include:         map[string]struct{}{},
+		Exclude:         map[string]struct{}{},
+		Deps:            append([]Dependency(nil), in.Deps...),
+		MinObservations: in.MinObservations,
+		MaxFailureRate:  in.MaxFailureRate,
 	}
 	for _, u := range in.Include {
 		rv.Include[u] = struct{}{}
@@ -607,7 +656,8 @@ func rulesHash(rules []RuleInput) string {
 		exc := append([]string(nil), r.Exclude...)
 		sort.Strings(inc)
 		sort.Strings(exc)
-		fmt.Fprintf(h, "%s@%d pct=%d", r.Feature, r.Version, r.Percentage)
+		fmt.Fprintf(h, "%s@%d pct=%d guard=%d/%g", r.Feature, r.Version, r.Percentage,
+			r.MinObservations, r.MaxFailureRate)
 		for _, u := range inc {
 			fmt.Fprintf(h, "|+%s", u)
 		}
