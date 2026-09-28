@@ -17,6 +17,7 @@ type RuleInput struct {
 	Include    []string     // 明确放行的用户（优先于百分比）
 	Exclude    []string     // 明确排除的用户（优先于 Include）
 	Deps       []Dependency // 前置依赖
+	Guard      *GuardConfig // 自动暂停保护；nil 表示不启用
 }
 
 // RuleVersion 是已发布的规则版本。发布后不可修改，任何字段都不应被改写。
@@ -27,6 +28,7 @@ type RuleVersion struct {
 	Include    map[string]struct{}
 	Exclude    map[string]struct{}
 	Deps       []Dependency
+	Guard      *GuardConfig
 }
 
 // Snapshot 是一份整组一致的已发布快照：每个功能至多一个当前版本。

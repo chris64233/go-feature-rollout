@@ -31,13 +31,24 @@ type Service struct {
 	// 按序列号保存每一份曾经生效的快照，用于回滚时重新激活历史一致快照。
 	snapshots map[uint64]*Snapshot
 	// 单调递增的发布序列号。
-	seq uint64
+	seq     uint64
 	history []PublishRecord
 
 	// 外部变更号 -> 该变更号首次成功发布产生的记录。
 	// 同号重复提交时比对内容哈希：一致则幂等返回，不一致报冲突。
-	changeSeq map[string]uint64
+	changeSeq  map[string]uint64
 	changeHash map[string]string
+
+	// 线上结果统计：feature -> version -> 该版本的独立统计。
+	// 按版本隔离，旧版本的结果不会混入新版本。
+	stats map[string]map[int]*versionStats
+	// 已自动暂停的版本：feature -> version -> true。暂停不可逆，
+	// 恢复放量只能发布更新版本（统计随新版本重新计数）。
+	paused map[string]map[int]bool
+	// 暂停事件记录，含触发时的统计快照与原因。
+	pauses []PauseRecord
+	// 暂停通知回调，每次暂停至多调用一次（在锁外调用）。
+	notifier func(PauseRecord)
 }
 
 // NewService 创建空服务。
@@ -49,6 +60,8 @@ func NewService() *Service {
 		snapshots:  map[uint64]*Snapshot{},
 		changeSeq:  map[string]uint64{},
 		changeHash: map[string]string{},
+		stats:      map[string]map[int]*versionStats{},
+		paused:     map[string]map[int]bool{},
 	}
 	empty := &Snapshot{Seq: 0, Rules: map[string]*RuleVersion{}}
 	s.currentSnap = empty
@@ -154,6 +167,14 @@ func (s *Service) publishLocked(changeID string, rules []RuleInput, hash, kind s
 	// 回滚只切换指针：版本库中没有任何新版本产生，目标快照原样重新激活。
 	if kind == "rollback" {
 		target := s.snapshots[rollbackTo]
+		// 目标快照中若含已被自动暂停的版本，重新激活它属于过期操作，拒绝。
+		// 该检查在幂等短路之后：已成功过的同号回滚重放仍幂等返回首次结果。
+		for f, r := range target.Rules {
+			if s.paused[f][r.Version] {
+				return nil, versionErr("snapshot seq %d cannot be reactivated: feature %q version %d was auto-paused",
+					rollbackTo, f, r.Version)
+			}
+		}
 		return s.commitRollbackLocked(changeID, hash, target)
 	}
 	if err := s.validateLocked(rules); err != nil {
@@ -519,6 +540,16 @@ func validateRules(rules []RuleInput) error {
 		if r.Percentage < 0 || r.Percentage > 100 {
 			return paramErr("feature %q percentage must be in [0,100], got %d", r.Feature, r.Percentage)
 		}
+		if r.Guard != nil {
+			if r.Guard.MinObservations < 1 {
+				return paramErr("feature %q guard min observations must be >= 1, got %d",
+					r.Feature, r.Guard.MinObservations)
+			}
+			if r.Guard.MaxFailureRatio <= 0 || r.Guard.MaxFailureRatio > 1 {
+				return paramErr("feature %q guard max failure ratio must be in (0,1], got %v",
+					r.Feature, r.Guard.MaxFailureRatio)
+			}
+		}
 		depFeatures := map[string]bool{}
 		for _, dep := range r.Deps {
 			if dep.Feature == "" {
@@ -547,6 +578,7 @@ func toRuleVersion(in RuleInput) *RuleVersion {
 		Include:    map[string]struct{}{},
 		Exclude:    map[string]struct{}{},
 		Deps:       append([]Dependency(nil), in.Deps...),
+		Guard:      cloneGuard(in.Guard),
 	}
 	for _, u := range in.Include {
 		rv.Include[u] = struct{}{}
@@ -564,6 +596,7 @@ func cloneInputs(rules []RuleInput) []RuleInput {
 		cp.Include = append([]string(nil), r.Include...)
 		cp.Exclude = append([]string(nil), r.Exclude...)
 		cp.Deps = append([]Dependency(nil), r.Deps...)
+		cp.Guard = cloneGuard(r.Guard)
 		out[i] = cp
 	}
 	return out
@@ -589,6 +622,15 @@ func cloneRule(r *RuleVersion) *RuleVersion {
 		cp.Exclude[u] = struct{}{}
 	}
 	cp.Deps = append([]Dependency(nil), r.Deps...)
+	cp.Guard = cloneGuard(r.Guard)
+	return &cp
+}
+
+func cloneGuard(g *GuardConfig) *GuardConfig {
+	if g == nil {
+		return nil
+	}
+	cp := *g
 	return &cp
 }
 
@@ -618,6 +660,9 @@ func rulesHash(rules []RuleInput) string {
 		sort.Slice(deps, func(i, j int) bool { return deps[i].Feature < deps[j].Feature })
 		for _, d := range deps {
 			fmt.Fprintf(h, "|dep=%s@%d", d.Feature, d.Version)
+		}
+		if r.Guard != nil {
+			fmt.Fprintf(h, "|guard=min%d,max%g", r.Guard.MinObservations, r.Guard.MaxFailureRatio)
 		}
 		h.Write([]byte{'\n'})
 	}

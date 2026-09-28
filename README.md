@@ -1,6 +1,6 @@
 # go-feature-rollout
 
-功能灰度规则服务：支持**多功能版本整组原子发布**、确定性分桶判定、前置依赖、幂等发布与快照回滚。
+功能灰度规则服务：支持**多功能版本整组原子发布**、确定性分桶判定、前置依赖、幂等发布与快照回滚，以及基于线上结果的**自动暂停保护**。
 
 开发环境：Go 1.23.0。
 
@@ -55,6 +55,39 @@ cur := s.CurrentRule("search-v2")   // 当前版本
 old, err := s.EvalAt(seq, "search-v2", "alice") // 历史快照回放
 ```
 
+## 结果上报与自动暂停
+
+发布版本可携带保护配置 `GuardConfig`（随版本不可变）：
+
+```go
+res, _ := s.Publish("chg-2001", []featurerollout.RuleInput{
+    {Feature: "search-v2", Version: 3, Percentage: 20,
+        Guard: &featurerollout.GuardConfig{
+            MinObservations: 100,  // 至少累计 100 次观察才做判定
+            MaxFailureRatio: 0.05, // 失败比例严格超过 5% 即暂停
+        }},
+})
+```
+
+**上报规则**（`ReportResult(feature, version, reportID, failed)`）：
+
+- 上报必须关联**实际生效的版本号**；统计按 `(feature, version)` 隔离，旧版本的结果不会混入新版本，新版本的统计从零开始；
+- `reportID` 由上报方生成并保证唯一：同一 `reportID` 重复上报**不重复计数**，幂等返回已有统计；
+- 上报给从未发布过的功能/版本会报错（`KindNotFound` / `KindVersion`）。
+
+**暂停规则**：
+
+- 每次计入新结果后检查：去重后的观察数 `>= MinObservations` 且失败比例**严格大于** `MaxFailureRatio` 时，自动暂停该版本；
+- 暂停 = 生成一份新快照，该功能的当前版本回退到**上一稳定版本**（最高的未暂停旧版本；没有则功能整体下线），新判定立即按旧版本放行；历史快照不可变，既有判定可通过 `EvalAt` 原样回放；
+- 每个版本**至多暂停一次**：暂停后的重复上报、重复 `CheckGuard` 检查不会再产生状态变化，通知回调（`SetPauseNotifier`）也至多触发一次；
+- 与人工操作并发时按发布版本拒绝过期操作：被暂停版本必须仍是当前版本，否则（已人工回滚或重新发布）暂停被放弃；回滚到含已暂停版本的历史快照会被拒绝（`KindVersion`）。恢复放量需发布更新的版本；
+- 每次暂停保存 `PauseRecord`：触发原因、统计快照（观察数、失败数、失败比例、上限配置）以及**全部被计入的 reportID 列表**，可通过 `PauseOf(feature)` / `Pauses()` 查询；`StatsOf(feature, version)` 可查看任意版本的实时统计。
+
+```go
+out, _ := s.ReportResult("search-v2", 3, "req-9f2c", true) // out.Paused 表示本次触发了暂停
+pause, ok := s.PauseOf("search-v2") // pause.Reason / pause.Stats / pause.Seq
+```
+
 ## 幂等与冲突
 
 发布/回滚按**外部变更号（changeID）幂等**：
@@ -79,6 +112,7 @@ old, err := s.EvalAt(seq, "search-v2", "alice") // 历史快照回放
 
 - 发布与回滚在写锁内串行执行，序列号严格单调；
 - 校验与状态切换在同一临界区内完成，失败不留下任何部分状态；
+- 结果上报的计数、越线检查与自动暂停在同一临界区内原子完成，与并发的人工回滚/重新发布串行化，过期操作按发布版本被拒绝；
 - 判定在锁内取出当前不可变快照后在锁外求值，与并发发布/回滚互不干扰。
 
 以上性质由 `service_test.go` 中的并发测试（`go test -race`）覆盖。
