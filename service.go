@@ -31,24 +31,39 @@ type Service struct {
 	// 按序列号保存每一份曾经生效的快照，用于回滚时重新激活历史一致快照。
 	snapshots map[uint64]*Snapshot
 	// 单调递增的发布序列号。
-	seq uint64
+	seq     uint64
 	history []PublishRecord
 
 	// 外部变更号 -> 该变更号首次成功发布产生的记录。
 	// 同号重复提交时比对内容哈希：一致则幂等返回，不一致报冲突。
-	changeSeq map[string]uint64
+	changeSeq  map[string]uint64
 	changeHash map[string]string
+
+	// 分批恢复：计划按 ID 与外部变更号各存一份索引。
+	//   - activeRecovery：进行中（observing/ready/paused）的计划，阻止同功能再起新恢复；
+	//   - gateRecovery：仍在约束放量的计划（含 blocked/cancelled/completed，停在安全比例），
+	//     直到版本漂移（发布/回滚切换到别的版本）或被同版本的新恢复计划取代。
+	recoveryPlans      map[string]*RecoveryPlan
+	recoveryChange     map[string]string // changeID -> planID
+	recoveryChangeHash map[string]string // changeID -> 首次创建时的内容哈希
+	activeRecovery     map[string]string // feature -> planID
+	gateRecovery       map[string]string // feature -> planID
 }
 
 // NewService 创建空服务。
 func NewService() *Service {
 	s := &Service{
-		drafts:     map[string]*Draft{},
-		versions:   map[string]map[int]*RuleVersion{},
-		current:    map[string]int{},
-		snapshots:  map[uint64]*Snapshot{},
-		changeSeq:  map[string]uint64{},
-		changeHash: map[string]string{},
+		drafts:             map[string]*Draft{},
+		versions:           map[string]map[int]*RuleVersion{},
+		current:            map[string]int{},
+		snapshots:          map[uint64]*Snapshot{},
+		changeSeq:          map[string]uint64{},
+		changeHash:         map[string]string{},
+		recoveryPlans:      map[string]*RecoveryPlan{},
+		recoveryChange:     map[string]string{},
+		recoveryChangeHash: map[string]string{},
+		activeRecovery:     map[string]string{},
+		gateRecovery:       map[string]string{},
 	}
 	empty := &Snapshot{Seq: 0, Rules: map[string]*RuleVersion{}}
 	s.currentSnap = empty
@@ -219,7 +234,31 @@ func (s *Service) publishLocked(changeID string, rules []RuleInput, hash, kind s
 	s.changeSeq[changeID] = newSeq
 	s.changeHash[changeID] = hash
 
+	s.supersedeStaleRecoveryLocked()
 	return &PublishResult{Seq: newSeq, ChangeID: changeID, Features: features}, nil
+}
+
+// supersedeStaleRecoveryLocked 在发布/回滚切换快照后，把目标版本已漂移的
+// 恢复计划标记为 superseded：旧计划不再控制放量，对其的后续操作报冲突。
+// 调用方持有写锁。
+func (s *Service) supersedeStaleRecoveryLocked() {
+	for feature, planID := range s.gateRecovery {
+		plan := s.recoveryPlans[planID]
+		if plan == nil {
+			delete(s.gateRecovery, feature)
+			continue
+		}
+		r, ok := s.currentSnap.Rules[feature]
+		if ok && r.Version == plan.Version {
+			continue
+		}
+		plan.Status = RecoverySuperseded
+		plan.BlockReason = fmt.Sprintf("feature %q current version changed away from %d",
+			feature, plan.Version)
+		plan.UpdatedAt = time.Now().UTC()
+		delete(s.activeRecovery, feature)
+		delete(s.gateRecovery, feature)
+	}
 }
 
 func (s *Service) recordBySeq(seq uint64) PublishRecord {
@@ -289,6 +328,7 @@ func (s *Service) commitRollbackLocked(changeID, hash string, target *Snapshot) 
 	s.history = append(s.history, rec)
 	s.changeSeq[changeID] = newSeq
 	s.changeHash[changeID] = hash
+	s.supersedeStaleRecoveryLocked()
 
 	return &PublishResult{Seq: newSeq, ChangeID: changeID, Features: features}, nil
 }
@@ -297,9 +337,10 @@ func (s *Service) commitRollbackLocked(changeID, hash string, target *Snapshot) 
 
 // EvalResult 是一次在线判定的结果。
 type EvalResult struct {
-	Allowed bool
-	Version int    // 命中的当前规则版本；功能不存在时为 0
-	Seq     uint64 // 本次判定使用的已发布快照序列号
+	Allowed    bool
+	Version    int    // 命中的当前规则版本；功能不存在时为 0
+	Seq        uint64 // 本次判定使用的已发布快照序列号
+	Percentage int    // 实际生效的放量百分比（可能受分批恢复闸门约束）；功能不存在时为 0
 }
 
 // Evaluate 在当前已发布快照上判定某用户对某功能是否放行。
@@ -307,8 +348,23 @@ type EvalResult struct {
 // 整个判定沿依赖链使用同一份不可变 Snapshot：判定期间发生的发布/回滚
 // 不会影响本次结果，也不会出现主功能读到新版本、依赖读到旧版本的混合态。
 func (s *Service) Evaluate(feature, userID string) EvalResult {
-	snap := s.snapshot()
-	return s.evalSnapshot(snap, feature, userID, map[string]bool{})
+	s.mu.RLock()
+	snap := s.currentSnap
+	// 在同一把读锁内取出全部恢复闸门，保证本次判定沿依赖链使用
+	// "同一份快照 + 同一刻恢复状态"，看不到交错迁移的中间态。
+	gates := make(map[string]int, len(s.gateRecovery))
+	for f, planID := range s.gateRecovery {
+		plan := s.recoveryPlans[planID]
+		r, ok := snap.Rules[f]
+		if plan == nil || !ok || r.Version != plan.Version {
+			continue
+		}
+		if pct, on := s.recoveryGatePctLocked(f, r.Percentage); on {
+			gates[f] = pct
+		}
+	}
+	s.mu.RUnlock()
+	return s.evalSnapshot(snap, gates, feature, userID, map[string]bool{})
 }
 
 // EvalAt 在指定历史快照上判定，主要用于回放/审计。
@@ -319,49 +375,50 @@ func (s *Service) EvalAt(seq uint64, feature, userID string) (EvalResult, error)
 	if !ok {
 		return EvalResult{}, versionErr("snapshot seq %d does not exist", seq)
 	}
-	return s.evalSnapshot(snap, feature, userID, map[string]bool{}), nil
+	// 历史回放不施加恢复闸门，按当时规则判定。
+	return s.evalSnapshot(snap, nil, feature, userID, map[string]bool{}), nil
 }
 
-func (s *Service) snapshot() *Snapshot {
-	s.mu.RLock()
-	snap := s.currentSnap
-	s.mu.RUnlock()
-	return snap
-}
-
-func (s *Service) evalSnapshot(snap *Snapshot, feature, userID string, visiting map[string]bool) EvalResult {
+// evalSnapshot 在给定快照（及恢复闸门）上沿依赖链判定。
+// gates 命中某功能时，其百分比分桶使用 gates[feature] 而非规则百分比；
+// 名单（Include/Exclude）与依赖判定不受闸门影响。
+func (s *Service) evalSnapshot(snap *Snapshot, gates map[string]int, feature, userID string, visiting map[string]bool) EvalResult {
 	rule, ok := snap.Rules[feature]
 	if !ok {
 		return EvalResult{Allowed: false, Version: 0, Seq: snap.Seq}
+	}
+	pct := rule.Percentage
+	if gated, ok := gates[feature]; ok {
+		pct = gated
 	}
 
 	// 先沿依赖链判定。任一依赖：不存在 / 当前版本低于要求 / 对用户不放行，则整体拒绝。
 	for _, dep := range rule.Deps {
 		depRule, ok := snap.Rules[dep.Feature]
 		if !ok || depRule.Version < dep.Version {
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 		}
 		if visiting[dep.Feature] {
 			// 发布时已保证不成环；此处是防御性处理。
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 		}
 		visiting[dep.Feature] = true
-		res := s.evalSnapshot(snap, dep.Feature, userID, visiting)
+		res := s.evalSnapshot(snap, gates, dep.Feature, userID, visiting)
 		delete(visiting, dep.Feature)
 		if !res.Allowed {
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 		}
 	}
 
 	// 排除优先，其次明确包含，最后确定性百分比分桶。
 	if _, excluded := rule.Exclude[userID]; excluded {
-		return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+		return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 	}
 	if _, included := rule.Include[userID]; included {
-		return EvalResult{Allowed: true, Version: rule.Version, Seq: snap.Seq}
+		return EvalResult{Allowed: true, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 	}
-	allowed := rule.Percentage > 0 && bucket(feature, userID) < rule.Percentage
-	return EvalResult{Allowed: allowed, Version: rule.Version, Seq: snap.Seq}
+	allowed := pct > 0 && bucket(feature, userID) < pct
+	return EvalResult{Allowed: allowed, Version: rule.Version, Seq: snap.Seq, Percentage: pct}
 }
 
 // ---------------- 查询 ----------------
