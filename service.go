@@ -31,24 +31,48 @@ type Service struct {
 	// 按序列号保存每一份曾经生效的快照，用于回滚时重新激活历史一致快照。
 	snapshots map[uint64]*Snapshot
 	// 单调递增的发布序列号。
-	seq uint64
+	seq     uint64
 	history []PublishRecord
 
 	// 外部变更号 -> 该变更号首次成功发布产生的记录。
 	// 同号重复提交时比对内容哈希：一致则幂等返回，不一致报冲突。
-	changeSeq map[string]uint64
+	changeSeq  map[string]uint64
 	changeHash map[string]string
+
+	// 可在测试中固定的时间源。
+	now func() time.Time
+
+	// 人工受众覆盖。ovState 为不可变快照（copy-on-write），
+	// 判定在锁内取出指针后可在锁外安全读取。
+	ovState *overrideState
+	ovSeq   uint64
+	// 每个功能的发布代际：该功能每次发生版本指针变化（发布/回滚）都 +1。
+	// 覆盖绑定创建时的代际，代际变化即作废，保证不跨版本沿用。
+	epoch map[string]uint64
+	// 外部操作号 -> 首次操作记录，覆盖的创建/撤销/延长均按它幂等。
+	overrideOps map[string]overrideOp
+	// 不可变的在线判定历史（只追加，永不改写）。
+	decisions []Decision
 }
 
 // NewService 创建空服务。
 func NewService() *Service {
+	return NewServiceWithClock(func() time.Time { return time.Now().UTC() })
+}
+
+// NewServiceWithClock 创建使用指定时间源的服务，主要用于测试中固定时间。
+func NewServiceWithClock(now func() time.Time) *Service {
 	s := &Service{
-		drafts:     map[string]*Draft{},
-		versions:   map[string]map[int]*RuleVersion{},
-		current:    map[string]int{},
-		snapshots:  map[uint64]*Snapshot{},
-		changeSeq:  map[string]uint64{},
-		changeHash: map[string]string{},
+		drafts:      map[string]*Draft{},
+		versions:    map[string]map[int]*RuleVersion{},
+		current:     map[string]int{},
+		snapshots:   map[uint64]*Snapshot{},
+		changeSeq:   map[string]uint64{},
+		changeHash:  map[string]string{},
+		now:         now,
+		ovState:     newOverrideState(),
+		epoch:       map[string]uint64{},
+		overrideOps: map[string]overrideOp{},
 	}
 	empty := &Snapshot{Seq: 0, Rules: map[string]*RuleVersion{}}
 	s.currentSnap = empty
@@ -205,12 +229,15 @@ func (s *Service) publishLocked(changeID string, rules []RuleInput, hash, kind s
 		Kind:       kind,
 		Features:   features,
 		RollbackTo: rollbackTo,
-		Time:       time.Now().UTC(),
+		Time:       s.nowUTC(),
 	}
 
 	// 单点切换。
 	s.versions = nextVersions
 	for _, rv := range published {
+		if s.current[rv.Feature] != rv.Version {
+			s.epoch[rv.Feature]++
+		}
 		s.current[rv.Feature] = rv.Version
 	}
 	s.currentSnap = snap
@@ -219,7 +246,28 @@ func (s *Service) publishLocked(changeID string, rules []RuleInput, hash, kind s
 	s.changeSeq[changeID] = newSeq
 	s.changeHash[changeID] = hash
 
+	// 新版本发布后，绑定旧版本的人工覆盖立即作废，绝不沿用到新版本。
+	s.retireSupersededOverrides()
+
 	return &PublishResult{Seq: newSeq, ChangeID: changeID, Features: features}, nil
+}
+
+// bumpEpochsForSwitch 比对回滚前后每个功能的当前版本，
+// 版本发生变化（含回滚后已不存在的功能）的功能代际 +1。
+func (s *Service) bumpEpochsForSwitch(prev, target *Snapshot) {
+	features := map[string]struct{}{}
+	for f := range prev.Rules {
+		features[f] = struct{}{}
+	}
+	for f := range target.Rules {
+		features[f] = struct{}{}
+	}
+	for f := range features {
+		if prev.Rules[f] == nil || target.Rules[f] == nil ||
+			prev.Rules[f].Version != target.Rules[f].Version {
+			s.epoch[f]++
+		}
+	}
 }
 
 func (s *Service) recordBySeq(seq uint64) PublishRecord {
@@ -275,7 +323,7 @@ func (s *Service) commitRollbackLocked(changeID, hash string, target *Snapshot) 
 		Kind:       "rollback",
 		Features:   features,
 		RollbackTo: target.Seq,
-		Time:       time.Now().UTC(),
+		Time:       s.nowUTC(),
 	}
 
 	nextCurrent := make(map[string]int, len(target.Rules))
@@ -283,12 +331,17 @@ func (s *Service) commitRollbackLocked(changeID, hash string, target *Snapshot) 
 		nextCurrent[f] = r.Version
 	}
 
+	prev := s.currentSnap
 	s.currentSnap = snap
 	s.snapshots[newSeq] = snap
 	s.current = nextCurrent
 	s.history = append(s.history, rec)
 	s.changeSeq[changeID] = newSeq
 	s.changeHash[changeID] = hash
+
+	// 版本指针发生变化的功能代际 +1，作废其绑定旧版本的人工覆盖。
+	s.bumpEpochsForSwitch(prev, target)
+	s.retireSupersededOverrides()
 
 	return &PublishResult{Seq: newSeq, ChangeID: changeID, Features: features}, nil
 }
@@ -297,21 +350,50 @@ func (s *Service) commitRollbackLocked(changeID, hash string, target *Snapshot) 
 
 // EvalResult 是一次在线判定的结果。
 type EvalResult struct {
-	Allowed bool
-	Version int    // 命中的当前规则版本；功能不存在时为 0
-	Seq     uint64 // 本次判定使用的已发布快照序列号
+	Allowed    bool
+	Version    int    // 命中的当前规则版本；功能不存在时为 0
+	Seq        uint64 // 本次判定使用的已发布快照序列号
+	Source     string // 最终命中的规则来源，见 Source* 常量
+	OverrideID string // 命中人工覆盖时的覆盖 ID，否则为空
 }
 
 // Evaluate 在当前已发布快照上判定某用户对某功能是否放行。
 //
 // 整个判定沿依赖链使用同一份不可变 Snapshot：判定期间发生的发布/回滚
 // 不会影响本次结果，也不会出现主功能读到新版本、依赖读到旧版本的混合态。
+//
+// 取值顺序：屏蔽覆盖 > 放行覆盖 > 前置依赖 > 规则排除名单 > 规则包含名单 >
+// 确定性分桶。覆盖只对当前发布指针与创建时一致的版本有效。
 func (s *Service) Evaluate(feature, userID string) EvalResult {
-	snap := s.snapshot()
-	return s.evalSnapshot(snap, feature, userID, map[string]bool{})
+	s.mu.RLock()
+	snap := s.currentSnap
+	ovs := s.ovState
+	now := s.now()
+	epochs := make(map[string]uint64, len(s.epoch))
+	for f, e := range s.epoch {
+		epochs[f] = e
+	}
+	s.mu.RUnlock()
+	res := s.evalLocked(snap, ovs, epochs, now, feature, userID, map[string]bool{})
+
+	// 追加不可变判定记录：后续撤销/过期/版本切换都不会改写它。
+	s.mu.Lock()
+	s.decisions = append(s.decisions, Decision{
+		Feature:    feature,
+		UserID:     userID,
+		Allowed:    res.Allowed,
+		Source:     res.Source,
+		Version:    res.Version,
+		Seq:        res.Seq,
+		OverrideID: res.OverrideID,
+		Time:       now.UTC(),
+	})
+	s.mu.Unlock()
+	return res
 }
 
 // EvalAt 在指定历史快照上判定，主要用于回放/审计。
+// 历史回放只还原当时的规则与分桶，不套用人工覆盖。
 func (s *Service) EvalAt(seq uint64, feature, userID string) (EvalResult, error) {
 	s.mu.RLock()
 	snap, ok := s.snapshots[seq]
@@ -322,46 +404,68 @@ func (s *Service) EvalAt(seq uint64, feature, userID string) (EvalResult, error)
 	return s.evalSnapshot(snap, feature, userID, map[string]bool{}), nil
 }
 
-func (s *Service) snapshot() *Snapshot {
-	s.mu.RLock()
-	snap := s.currentSnap
-	s.mu.RUnlock()
-	return snap
+// evalLocked 是在线判定入口：在同一时间视图上先查人工覆盖，再走依赖与规则。
+func (s *Service) evalLocked(snap *Snapshot, ovs *overrideState, epochs map[string]uint64, now time.Time, feature, userID string, visiting map[string]bool) EvalResult {
+	rule, ok := snap.Rules[feature]
+	if !ok {
+		return EvalResult{Allowed: false, Version: 0, Seq: snap.Seq, Source: SourceFeatureMissing}
+	}
+
+	// 人工覆盖优先级最高：屏蔽 > 放行。
+	// 覆盖必须与当前规则版本、发布代际同时一致，旧版本决定不会泄漏到新版本。
+	if ov := ovs.find(feature, userID, rule.Version, epochs[feature]); ov != nil && ov.ActiveAt(now) {
+		res := EvalResult{
+			Allowed:    ov.Kind == OverrideAllow,
+			Version:    rule.Version,
+			Seq:        snap.Seq,
+			OverrideID: ov.ID,
+		}
+		if ov.Kind == OverrideBlock {
+			res.Source = SourceBlockOverride
+		} else {
+			res.Source = SourceAllowOverride
+		}
+		return res
+	}
+
+	// 覆盖不命中时，退回原有依赖与灰度规则。
+	res := s.evalSnapshot(snap, feature, userID, visiting)
+	return res
 }
 
 func (s *Service) evalSnapshot(snap *Snapshot, feature, userID string, visiting map[string]bool) EvalResult {
 	rule, ok := snap.Rules[feature]
 	if !ok {
-		return EvalResult{Allowed: false, Version: 0, Seq: snap.Seq}
+		return EvalResult{Allowed: false, Version: 0, Seq: snap.Seq, Source: SourceFeatureMissing}
 	}
 
 	// 先沿依赖链判定。任一依赖：不存在 / 当前版本低于要求 / 对用户不放行，则整体拒绝。
 	for _, dep := range rule.Deps {
 		depRule, ok := snap.Rules[dep.Feature]
 		if !ok || depRule.Version < dep.Version {
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Source: SourceDependency}
 		}
 		if visiting[dep.Feature] {
 			// 发布时已保证不成环；此处是防御性处理。
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Source: SourceDependency}
 		}
 		visiting[dep.Feature] = true
 		res := s.evalSnapshot(snap, dep.Feature, userID, visiting)
 		delete(visiting, dep.Feature)
 		if !res.Allowed {
-			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+			return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Source: SourceDependency}
 		}
 	}
 
 	// 排除优先，其次明确包含，最后确定性百分比分桶。
 	if _, excluded := rule.Exclude[userID]; excluded {
-		return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq}
+		return EvalResult{Allowed: false, Version: rule.Version, Seq: snap.Seq, Source: SourceExcludeList}
 	}
 	if _, included := rule.Include[userID]; included {
-		return EvalResult{Allowed: true, Version: rule.Version, Seq: snap.Seq}
+		return EvalResult{Allowed: true, Version: rule.Version, Seq: snap.Seq, Source: SourceIncludeList}
 	}
 	allowed := rule.Percentage > 0 && bucket(feature, userID) < rule.Percentage
-	return EvalResult{Allowed: allowed, Version: rule.Version, Seq: snap.Seq}
+	return EvalResult{Allowed: allowed, Version: rule.Version, Seq: snap.Seq, Source: SourceBucket}
 }
 
 // ---------------- 查询 ----------------

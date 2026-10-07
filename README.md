@@ -29,6 +29,76 @@
 - 同一用户面对同一规则版本，结果始终稳定；
 - 百分比上调只扩大受众、下调只收缩受众，不会因版本切换重新洗牌。
 
+## 有期限的人工受众覆盖
+
+用于紧急放行或临时屏蔽**少量用户**。覆盖是带时间窗的人工决定（生效时间、
+到期时间、原因、操作人），与灰度规则分离存储，按外部操作号幂等管理。
+
+### 判定优先级
+
+在线判定按以下顺序取第一个命中的结论，`EvalResult.Source` 说明最终命中来源：
+
+1. `block_override`：屏蔽覆盖——最高优先级，连依赖失败也可以被显式确认；
+2. `allow_override`：放行覆盖——优先于前置依赖与灰度规则；
+3. `dependency`：前置依赖不存在、版本不足或对该用户拒绝；
+4. `exclude_list`：规则排除名单；
+5. `include_list`：规则包含名单；
+6. `bucket`：确定性百分比分桶；
+7. `feature_missing`：功能尚未发布。
+
+命中覆盖时 `EvalResult.OverrideID` 为覆盖 ID，否则为空。
+
+### 版本边界（覆盖不跨版本沿用）
+
+- 创建覆盖时必须指定**当时的当前规则版本**（必须已经发布且与当前指针一致），
+  同时记录该功能的“发布代际”；
+- 该功能一旦**发布新版本或回滚导致当前版本变化**，旧覆盖在同一写临界区内
+  立即作废（状态变为 `superseded`），新版本判定不再放行或屏蔽；
+- 回滚后旧覆盖**不会复活**；如需在重新激活的版本上放行，必须重新创建覆盖；
+- 覆盖只作用于在线判定（`Evaluate`），历史快照回放（`EvalAt`）不套用覆盖，
+  审计看到的始终是规则本身。
+
+### 时间窗与撤销
+
+- 时间窗为 `[StartAt, EndAt)`：生效时刻（含）起命中，到期时刻（不含）立即失效，
+  到期点放行绝不拖到下一次扫描；
+- `SweepExpiredOverrides` 只是把已到期覆盖物化为 `expired` 状态，在线判定本身
+  按同一时间视图检查到期，扫描/发布/判定并发时过期覆盖也不可能继续放行；
+- 撤销（`revoked`）只影响**后续**判定；每次在线判定追加一条不可变 `Decision`
+  记录（`Decisions()` 可查），撤销、过期、版本切换都不会改写历史判定；
+- 同一功能+用户在同一发布版本（同一发布代际）至多有一条有效覆盖。
+
+时间通过 `NewServiceWithClock(nowFunc)` 注入，测试可完全固定时间、无需真实等待。
+
+覆盖接口：
+
+```go
+s := featurerollout.NewServiceWithClock(myClock) // 也可继续用 NewService()
+
+// 创建（opID 幂等）
+r, err := s.CreateOverride("ops-1001", featurerollout.OverrideInput{
+    Feature: "search-v2", UserID: "alice", Version: 3,
+    Kind: featurerollout.OverrideAllow, // 或 OverrideBlock
+    StartAt: start, EndAt: start.Add(time.Hour),
+    Reason: "紧急放行", Operator: "admin",
+})
+
+// 撤销（只影响后续判定）
+s.RevokeOverride("ops-1002", featurerollout.RevokeOverrideInput{
+    Feature: "search-v2", UserID: "alice", Version: 3})
+
+// 延长到期时间（NewEnd 必须严格晚于当前 EndAt）
+s.ExtendOverride("ops-1003", featurerollout.ExtendOverrideInput{
+    Feature: "search-v2", UserID: "alice", Version: 3,
+    NewEnd: start.Add(3 * time.Hour), Reason: "继续观察"})
+
+s.SweepExpiredOverrides()                    // 物化过期状态
+ov, _ := s.GetOverride(r.Override.ID)        // 单条查询（含历史覆盖）
+s.ListOverrides("search-v2", "alice", 0)     // 某用户的覆盖历史
+s.ActiveOverrides()                          // 当前生效窗口内的覆盖
+for _, d := range s.Decisions() { ... }      // 不可变判定记录（含命中来源）
+```
+
 ## 接口
 
 ```go
@@ -75,10 +145,23 @@ old, err := s.EvalAt(seq, "search-v2", "alice") // 历史快照回放
 | `KindConflict` | 同一变更号提交了不同内容 |
 | `KindNotFound` | 草拟等对象不存在 |
 
+覆盖操作沿用同一错误分类：参数/时间窗非法为 `KindParam`，目标版本不是当前版本
+为 `KindVersion`，功能未发布或覆盖不存在为 `KindNotFound`，同版本已有有效覆盖、
+同一操作号重放内容变化为 `KindConflict`。
+
+覆盖的创建/撤销/延长均按**外部操作号（opID）幂等**：
+
+- 同一 opID 以相同内容重放（含相同操作类型）→ 返回首次结果，
+  `OverrideResult.Replayed == true`，不产生新覆盖；
+- 用户、功能、版本、时间、原因或操作人任一变化，或换了操作类型 → `KindConflict`。
+
 ## 并发保证
 
 - 发布与回滚在写锁内串行执行，序列号严格单调；
 - 校验与状态切换在同一临界区内完成，失败不留下任何部分状态；
 - 判定在锁内取出当前不可变快照后在锁外求值，与并发发布/回滚互不干扰。
+- 覆盖集合采用 copy-on-write 不可变快照，判定取出快照指针与统一时间视图后
+  在锁外求值；覆盖到期扫描、版本切换与在线判定并发时，过期覆盖不会继续放行，
+  迟到的旧版本操作（目标版本已不是当前指针）直接失败，不会覆盖当前发布指针。
 
 以上性质由 `service_test.go` 中的并发测试（`go test -race`）覆盖。
