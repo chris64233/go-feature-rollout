@@ -60,3 +60,92 @@ type Draft struct {
 	Rules    []RuleInput
 	Hash     string // 规则内容的规范化哈希，用于幂等校验
 }
+
+// OverrideEffect 是人工受众覆盖的效果：紧急放行或临时屏蔽。
+type OverrideEffect string
+
+const (
+	// OverrideAllow 放行覆盖：命中即放行，优先于依赖与灰度规则。
+	OverrideAllow OverrideEffect = "allow"
+	// OverrideDeny 屏蔽覆盖：命中即拒绝，优先级最高。
+	OverrideDeny OverrideEffect = "deny"
+)
+
+// 覆盖（及普通规则）在判定结果中的命中来源。
+const (
+	// ReasonNoRule 功能在当前快照中不存在任何已发布规则。
+	ReasonNoRule = "no_rule"
+	// ReasonOverrideDeny 命中屏蔽覆盖（最高优先级）。
+	ReasonOverrideDeny = "override_deny"
+	// ReasonOverrideAllow 命中放行覆盖（优先于依赖与灰度规则）。
+	ReasonOverrideAllow = "override_allow"
+	// ReasonDependency 前置依赖未满足（依赖功能缺失、版本过低或对该用户不放行）。
+	ReasonDependency = "dependency"
+	// ReasonExclude 命中规则排除名单。
+	ReasonExclude = "exclude"
+	// ReasonInclude 命中规则包含名单。
+	ReasonInclude = "include"
+	// ReasonPercentage 命中确定性百分比分桶（放行或拒绝）。
+	ReasonPercentage = "percentage"
+)
+
+// OverrideStatus 是覆盖的生命周期状态。
+type OverrideStatus string
+
+const (
+	// OverrideActive 有效：可能尚未到生效时间，也可能正在生效。
+	OverrideActive OverrideStatus = "active"
+	// OverrideRevoked 被人工撤销；只影响撤销之后的判定。
+	OverrideRevoked OverrideStatus = "revoked"
+	// OverrideExpired 已到期（扫描任务或判定时按时钟确认）。
+	OverrideExpired OverrideStatus = "expired"
+	// OverrideSuperseded 所绑定的发布版本已不再是当前版本
+	// （新版本发布或回滚产生了新的版本代际），覆盖自动失效且不会随回滚复活。
+	OverrideSuperseded OverrideStatus = "superseded"
+)
+
+// OverrideInput 是创建人工受众覆盖的请求。
+//
+// Version 为覆盖绑定的规则版本：必须是创建时该功能的当前发布版本；
+// 传 0 表示绑定创建时刻的当前版本。覆盖永远不会作用于其他版本。
+type OverrideInput struct {
+	Feature   string
+	UserID    string
+	Version   int // 0 表示创建时的当前版本
+	Effect    OverrideEffect
+	Effective time.Time // 生效时间（UTC）
+	Expires   time.Time // 到期时间（不含，UTC），必须晚于生效时间与当前时间
+	Reason    string
+	Operator  string
+}
+
+// Override 是一条有期限的人工受众覆盖，创建后除到期时间外不可修改。
+type Override struct {
+	ID         string
+	Feature    string
+	UserID     string
+	Version    int    // 绑定的规则版本
+	Generation uint64 // 绑定的发布版本代际，发布/回滚切换版本后递增
+	Effect     OverrideEffect
+	Effective  time.Time
+	Expires    time.Time
+	Reason     string
+	Operator   string
+	Status     OverrideStatus
+	CreatedAt  time.Time
+}
+
+// OverrideResult 是创建/撤销/延长覆盖成功后的结果。
+// 同一外部操作号重放返回首次结果（含当时的到期时间与状态）。
+type OverrideResult struct {
+	OverrideID string
+	OpID       string
+	OpKind     string // "create" / "revoke" / "extend"
+	Feature    string
+	UserID     string
+	Version    int
+	Effect     OverrideEffect
+	Status     OverrideStatus
+	Effective  time.Time
+	Expires    time.Time
+}
